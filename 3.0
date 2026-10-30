@@ -75,6 +75,10 @@ CREATE TABLE dbo.Job_Homologacion_Precios_Ejecucion (
 GO
 
 
+SET ANSI_NULLS ON;
+GO
+SET QUOTED_IDENTIFIER ON;
+GO
 CREATE OR ALTER PROCEDURE dbo.usp_Job_Homologacion_Precios
     @SoloReporte BIT = 1
 AS
@@ -377,7 +381,11 @@ BEGIN
                            and d.filas = 1 and d.fecha is not null) as m
             cross apply (select count(distinct d.price) as precios,
                                 min(d.price) as price,
-                                string_agg(d.caja, ',') within group (order by d.cash_number) as cajas
+                                stuff((select ',' + d.caja from #detalle as d
+                                where d.sku = c.sku and d.typePrice = c.typePrice
+                                  and d.filas = 1 and d.fecha = m.fecha_max
+                                order by d.cash_number
+                                for xml path(''), type).value('.', 'varchar(200)'), 1, 1, '') as cajas
                          from #detalle as d
                          where d.sku = c.sku and d.typePrice = c.typePrice
                            and d.filas = 1 and d.fecha = m.fecha_max) as g
@@ -390,10 +398,11 @@ BEGIN
             update c
                set Cajas_Actualizar = u.cajas
             from #comparativa as c
-            cross apply (select string_agg(d.caja, ',') within group (order by d.cash_number) as cajas
-                         from #detalle as d
-                         where d.sku = c.sku and d.typePrice = c.typePrice
-                           and d.filas = 1 and d.price <> c.Precio_Ganador) as u
+            cross apply (select stuff((select ',' + d.caja from #detalle as d
+                                where d.sku = c.sku and d.typePrice = c.typePrice
+                                  and d.filas = 1 and d.price <> c.Precio_Ganador
+                                order by d.cash_number
+                                for xml path(''), type).value('.', 'varchar(500)'), 1, 1, '') as cajas) as u
             where c.Precio_Ganador is not null;
 
             -- Acción a tomar
@@ -410,12 +419,14 @@ BEGIN
                                  then 'REVISAR: no existe en ' + falta.cajas end)
                    end
             from #comparativa as c
-            outer apply (select string_agg(d.caja, ',') within group (order by d.cash_number) as cajas
-                         from #detalle as d
-                         where d.sku = c.sku and d.typePrice = c.typePrice and d.filas > 1) as dup
-            outer apply (select string_agg(d.caja, ',') within group (order by d.cash_number) as cajas
-                         from #detalle as d
-                         where d.sku = c.sku and d.typePrice = c.typePrice and d.filas is null) as falta;
+            outer apply (select stuff((select ',' + d.caja from #detalle as d
+                                where d.sku = c.sku and d.typePrice = c.typePrice and d.filas > 1
+                                order by d.cash_number
+                                for xml path(''), type).value('.', 'varchar(500)'), 1, 1, '') as cajas) as dup
+            outer apply (select stuff((select ',' + d.caja from #detalle as d
+                                where d.sku = c.sku and d.typePrice = c.typePrice and d.filas is null
+                                order by d.cash_number
+                                for xml path(''), type).value('.', 'varchar(500)'), 1, 1, '') as cajas) as falta;
 
             update #comparativa
                set Resultado = case when Accion like 'UPDATE%'   then 'PENDIENTE'
@@ -533,15 +544,16 @@ BEGIN
                Tabla de lo que se cambiaría (o se cambió): una columna de precio
                y una de fecha por cada caja
                ----------------------------------------------------------------- */
-            SELECT @cols_precio = STRING_AGG(CAST(
-                       N'max(case when d.cash_number = ' + CAST(cash_number AS NVARCHAR(10))
-                       + N' then d.price end) as ' + QUOTENAME(N'Precio_' + caja) AS NVARCHAR(MAX)), N', ')
-                       WITHIN GROUP (ORDER BY cash_number),
-                   @cols_fecha = STRING_AGG(CAST(
-                       N'max(case when d.cash_number = ' + CAST(cash_number AS NVARCHAR(10))
-                       + N' then d.fecha end) as ' + QUOTENAME(N'Fecha_' + caja) AS NVARCHAR(MAX)), N', ')
-                       WITHIN GROUP (ORDER BY cash_number)
-            FROM #cajas;
+            SET @cols_precio = STUFF((
+                SELECT N', max(case when d.cash_number = ' + CAST(cash_number AS NVARCHAR(10))
+                     + N' then d.price end) as ' + QUOTENAME(N'Precio_' + caja)
+                FROM #cajas ORDER BY cash_number
+                FOR XML PATH(''), TYPE).value('.', 'NVARCHAR(MAX)'), 1, 2, N'');
+            SET @cols_fecha = STUFF((
+                SELECT N', max(case when d.cash_number = ' + CAST(cash_number AS NVARCHAR(10))
+                     + N' then d.fecha end) as ' + QUOTENAME(N'Fecha_' + caja)
+                FROM #cajas ORDER BY cash_number
+                FOR XML PATH(''), TYPE).value('.', 'NVARCHAR(MAX)'), 1, 2, N'');
 
             SET @sql = N'set ansi_warnings off;
             select c.sku, c.typePrice, ' + @cols_precio + N',
