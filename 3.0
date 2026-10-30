@@ -4,10 +4,13 @@
 
    Cajas: se leen de dbo.Till (IS_ACTIVE = 1) en cada ejecución.
      - La caja con IS_SERVER = 1 es la local (la base donde corre el job).
-     - Las demás se localizan con las plantillas de la sección CONFIGURACIÓN,
-       usando {n} = CASH_NUMBER y {name} = NAME de Till.
-     - Una caja nueva en Till se incluye sola. Con @crear_servidores = 1, el
-       job crea su servidor vinculado a partir de NAME si todavía no existe.
+     - Cada caja se identifica solo por CASH_NUMBER. NAME puede cambiar, por
+       eso solo se usa como dato informativo en los mensajes.
+     - Las demás cajas se localizan con las plantillas de la sección
+       CONFIGURACIÓN, usando {n} = CASH_NUMBER.
+     - Una caja nueva en Till se incluye sola en cuanto exista su servidor
+       vinculado (producción). Si no existe, el job se cancela e indica cuál
+       falta.
 
    Flujo (según la especificación):
      1. Lock: si ya hay una ejecución en curso, esta se omite.
@@ -88,23 +91,17 @@ BEGIN
 
     /* =========================================================================
        CONFIGURACIÓN
-       Ubicación de las cajas que no son servidor. {n} = CASH_NUMBER, {name} = NAME.
+       Ubicación de las cajas que no son servidor. {n} = CASH_NUMBER.
 
        Ambiente de pruebas (todas las bases en la misma instancia):
-           @plantilla_servidor  = NULL
-           @plantilla_base      = N'XposStore_50LP1_v{n}'
-           @crear_servidores    = 0
-       Producción (un servidor vinculado por caja con el NAME de Till):
-           @plantilla_servidor  = N'{name}'
-           @plantilla_base      = N'XposStore'
-           @crear_servidores    = 1
-           @plantilla_instancia = N'{name}\SQLEXPRESS'   -- equipo\instancia de cada caja
+           @plantilla_servidor = NULL
+           @plantilla_base     = N'XposStore_50LP1_v{n}'
+       Producción (un servidor vinculado por caja: CAJA1, CAJA3, ...):
+           @plantilla_servidor = N'CAJA{n}'
+           @plantilla_base     = N'XposStore'
        ========================================================================= */
-    DECLARE @plantilla_servidor  SYSNAME       = NULL,
-            @plantilla_base      SYSNAME       = N'XposStore_50LP1_v{n}',
-            @crear_servidores    BIT           = 0,
-            @plantilla_instancia NVARCHAR(200) = N'{name}\SQLEXPRESS',
-            @proveedor           SYSNAME       = N'MSOLEDBSQL';
+    DECLARE @plantilla_servidor SYSNAME = NULL,
+            @plantilla_base     SYSNAME = N'XposStore_50LP1_v{n}';
 
     declare @price_types table (priceType varchar(100))
 
@@ -121,7 +118,7 @@ BEGIN
         cash_number INT            NOT NULL PRIMARY KEY,
         caja        VARCHAR(20)    NOT NULL,     -- 'Caja' + CASH_NUMBER
         es_servidor BIT            NOT NULL,
-        nombre      VARCHAR(100)   NULL,         -- NAME de Till
+        nombre      VARCHAR(100)   NULL,         -- NAME de Till (solo informativo)
         servidor    SYSNAME        NULL,         -- servidor vinculado (NULL = local)
         prefijo     NVARCHAR(400)  NULL,         -- [servidor].[base].dbo.
         en_linea    BIT            NULL,
@@ -150,8 +147,7 @@ BEGIN
             @sql         NVARCHAR(MAX),
             @cols_precio NVARCHAR(MAX),
             @cols_fecha  NVARCHAR(MAX),
-            @servidor    SYSNAME,
-            @instancia   NVARCHAR(200);
+            @servidor    SYSNAME;
 
     /* -------------------------------------------------------------------------
        1. Lock: solo una ejecución a la vez
@@ -208,13 +204,12 @@ BEGIN
                CASE WHEN t.IS_SERVER = 1
                     THEN QUOTENAME(DB_NAME()) + N'.dbo.'
                     ELSE ISNULL(QUOTENAME(s.servidor) + N'.', N'')
-                         + QUOTENAME(REPLACE(REPLACE(@plantilla_base, N'{n}', t.CASH_NUMBER),
-                                             N'{name}', LTRIM(RTRIM(t.NAME)))) + N'.dbo.'
+                         + QUOTENAME(REPLACE(@plantilla_base, N'{n}', t.CASH_NUMBER)) + N'.dbo.'
                END
         FROM dbo.Till AS t
         CROSS APPLY (SELECT CASE WHEN t.IS_SERVER = 0
-                                 THEN REPLACE(REPLACE(@plantilla_servidor, N'{n}', t.CASH_NUMBER),
-                                              N'{name}', LTRIM(RTRIM(t.NAME))) END AS servidor) AS s
+                                 THEN REPLACE(@plantilla_servidor, N'{n}', t.CASH_NUMBER)
+                            END AS servidor) AS s
         WHERE t.IS_ACTIVE = 1;
 
         IF (SELECT COUNT(*) FROM #cajas) < 2
@@ -225,42 +220,6 @@ BEGIN
         SET @Mensaje = NULL;
 
         /* ---------------------------------------------------------------------
-           Caja nueva en Till: crear su servidor vinculado si no existe
-           --------------------------------------------------------------------- */
-        IF @crear_servidores = 1
-        BEGIN
-            SET @n = (SELECT MIN(cash_number) FROM #cajas
-                      WHERE servidor IS NOT NULL
-                        AND NOT EXISTS (SELECT 1 FROM sys.servers WHERE name = servidor));
-            WHILE @n IS NOT NULL
-            BEGIN
-                SELECT @servidor  = servidor,
-                       @instancia = REPLACE(REPLACE(@plantilla_instancia, N'{n}', cash_number),
-                                            N'{name}', nombre)
-                FROM #cajas WHERE cash_number = @n;
-                BEGIN TRY
-                    EXEC sp_addlinkedserver @server = @servidor, @srvproduct = N'',
-                         @provider = @proveedor, @datasrc = @instancia,
-                         @provstr = N'Encrypt=yes;TrustServerCertificate=yes';
-                    -- Usa las credenciales con las que se ejecuta el job (ver PRODUCCIÓN)
-                    EXEC sp_addlinkedsrvlogin @rmtsrvname = @servidor, @useself = N'TRUE';
-                    EXEC sp_serveroption @servidor, 'connect timeout', '10';
-                    EXEC sp_serveroption @servidor, 'query timeout', '300';
-                END TRY
-                BEGIN CATCH
-                    UPDATE #cajas
-                       SET en_linea = 0,
-                           error = N'No se pudo crear el servidor vinculado ' + @servidor
-                                 + N': ' + ERROR_MESSAGE()
-                    WHERE cash_number = @n;
-                END CATCH;
-                SET @n = (SELECT MIN(cash_number) FROM #cajas
-                          WHERE cash_number > @n AND servidor IS NOT NULL
-                            AND NOT EXISTS (SELECT 1 FROM sys.servers WHERE name = servidor));
-            END
-        END
-
-        /* ---------------------------------------------------------------------
            2. Validar conexión a todas las cajas
            --------------------------------------------------------------------- */
         SET @n = (SELECT MIN(cash_number) FROM #cajas);
@@ -268,13 +227,12 @@ BEGIN
         BEGIN
             SET @sql = N'select top (0) 1 from ' + (SELECT prefijo FROM #cajas WHERE cash_number = @n) + N'PRICE';
             BEGIN TRY
-                IF EXISTS (SELECT 1 FROM #cajas WHERE cash_number = @n AND en_linea = 0)
-                    THROW 50004, N'Servidor vinculado no disponible.', 1;
                 SET @servidor = (SELECT servidor FROM #cajas WHERE cash_number = @n);
                 IF @servidor IS NOT NULL
                    AND NOT EXISTS (SELECT 1 FROM sys.servers WHERE name = @servidor)
                 BEGIN
-                    SET @Mensaje = N'No existe el servidor vinculado ' + @servidor + N'.';
+                    SET @Mensaje = N'No existe el servidor vinculado ' + @servidor
+                                 + N'. Crearlo apuntando al equipo de esta caja.';
                     THROW 50005, @Mensaje, 1;
                 END
                 EXEC (@sql);
@@ -633,45 +591,38 @@ GO
    PRODUCCIÓN
    -----------------------------------------------------------------------------
    1. En la sección CONFIGURACIÓN del procedimiento:
-      @plantilla_servidor  = N'{name}'
-      @plantilla_base      = N'XposStore'
-      @crear_servidores    = 1
-      @plantilla_instancia = N'{name}\SQLEXPRESS'
+      @plantilla_servidor = N'CAJA{n}'
+      @plantilla_base     = N'XposStore'
 
-      Con esto, cada caja activa de Till se busca en el equipo indicado por NAME
-      (por ejemplo ZAIASNVT1\SQLEXPRESS). Si su servidor vinculado no existe,
-      el job lo crea en la primera ejecución. Una caja nueva en Till entra sola.
+   2. Un servidor vinculado por cada caja que no es servidor, con el nombre
+      CAJA + CASH_NUMBER. Se crea una sola vez y apunta al equipo de la caja;
+      si cambia el NAME en Till no hay que modificar nada.
 
-   2. Credenciales: el servidor vinculado que crea el job usa las mismas
-      credenciales con las que se ejecuta el job. Recomendado:
-        - Un login SQL (por ejemplo homologacion.job) con el MISMO usuario y
-          contraseña en todas las cajas, con SELECT en item,
-          ITEM_BUSINESS_UNIT_LINK, PRICE y code, y UPDATE en PRICE.
-        - En la Caja 2 ese login necesita además permiso para crear
-          servidores vinculados (ALTER ANY LINKED SERVER y ALTER ANY LOGIN).
-      Requisitos de red: el nombre de cada equipo debe resolverse desde la
-      Caja 2, con SQL Server Browser activo (instancia con nombre) y el puerto
-      abierto en el firewall. El proveedor MSOLEDBSQL debe estar instalado.
-
-      Si se prefiere crear los servidores vinculados a mano (por ejemplo con
-      otro usuario), dejar @crear_servidores = 0 y crear uno por caja con el
-      nombre de NAME:
-
-      EXEC sp_addlinkedserver @server = N'ZAIASNVT1', @srvproduct = N'',
-           @provider = N'MSOLEDBSQL', @datasrc = N'ZAIASNVT1\SQLEXPRESS',
+      EXEC sp_addlinkedserver @server = N'CAJA1', @srvproduct = N'',
+           @provider = N'MSOLEDBSQL', @datasrc = N'<EQUIPO_CAJA1>\SQLEXPRESS',
            @provstr = N'Encrypt=yes;TrustServerCertificate=yes';
-      EXEC sp_addlinkedsrvlogin @rmtsrvname = N'ZAIASNVT1', @useself = N'FALSE',
+      EXEC sp_addlinkedsrvlogin @rmtsrvname = N'CAJA1', @useself = N'FALSE',
            @locallogin = NULL, @rmtuser = N'<USUARIO>', @rmtpassword = N'<PASSWORD>';
-      EXEC sp_serveroption N'ZAIASNVT1', 'connect timeout', '10';
-      EXEC sp_serveroption N'ZAIASNVT1', 'query timeout', '300';
+      EXEC sp_serveroption N'CAJA1', 'connect timeout', '10';
+      EXEC sp_serveroption N'CAJA1', 'query timeout', '300';
+
+      El usuario remoto necesita SELECT en item, ITEM_BUSINESS_UNIT_LINK, PRICE
+      y code, y UPDATE en PRICE.
+
+      Cajas activas de Till que todavía no tienen servidor vinculado:
+
+      SELECT t.CASH_NUMBER, t.NAME, 'CAJA' + CAST(t.CASH_NUMBER AS VARCHAR(10)) AS servidor_a_crear
+      FROM dbo.Till AS t
+      WHERE t.IS_ACTIVE = 1 AND t.IS_SERVER = 0
+        AND NOT EXISTS (SELECT 1 FROM sys.servers AS s
+                        WHERE s.name = 'CAJA' + CAST(t.CASH_NUMBER AS VARCHAR(10)));
 
       Si una caja activa en Till no responde o no tiene servidor vinculado, el
       job se cancela con "Error de conectividad", como indica la especificación.
 
-   3. Tarea programada (SQL Server Express no tiene SQL Server Agent), con el
-      login del punto 2:
+   3. Tarea programada (SQL Server Express no tiene SQL Server Agent):
 
       schtasks /Create /TN "Homologacion de precios" /SC MINUTE /MO 30 ^
-        /TR "sqlcmd -S localhost\SQLEXPRESS -U homologacion.job -P <PASSWORD> -b -d XposStore -Q \"EXEC dbo.usp_Job_Homologacion_Precios @SoloReporte = 0\"" ^
+        /TR "sqlcmd -S localhost\SQLEXPRESS -E -b -d XposStore -Q \"EXEC dbo.usp_Job_Homologacion_Precios @SoloReporte = 0\"" ^
         /RU <CUENTA> /RP <PASSWORD>
    ============================================================================= */
