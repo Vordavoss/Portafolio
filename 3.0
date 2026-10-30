@@ -175,11 +175,29 @@ BEGIN
         /* ---------------------------------------------------------------------
            Cajas activas desde Till
            --------------------------------------------------------------------- */
+        -- Contenido de Till para los mensajes de error
+        SELECT @Mensaje = STUFF((
+                   SELECT N' | CASH_NUMBER=' + ISNULL(CAST(CASH_NUMBER AS NVARCHAR(10)), N'NULL')
+                        + N' NAME=' + ISNULL(NAME, N'NULL')
+                        + N' IS_ACTIVE=' + ISNULL(CAST(IS_ACTIVE AS NVARCHAR(1)), N'NULL')
+                        + N' IS_SERVER=' + ISNULL(CAST(IS_SERVER AS NVARCHAR(1)), N'NULL')
+                   FROM dbo.Till ORDER BY CASH_NUMBER
+                   FOR XML PATH(''), TYPE).value('.', 'NVARCHAR(MAX)'), 1, 3, N'');
+        SET @Mensaje = N' Base: ' + DB_NAME() + N'. Till: ' + ISNULL(@Mensaje, N'(vacía)');
+
         IF EXISTS (SELECT CASH_NUMBER FROM dbo.Till WHERE IS_ACTIVE = 1
                    GROUP BY CASH_NUMBER HAVING COUNT(*) > 1)
-            THROW 50001, N'Till tiene CASH_NUMBER repetidos entre las cajas activas.', 1;
+        BEGIN
+            SET @Mensaje = N'Till tiene CASH_NUMBER repetidos entre las cajas activas.' + @Mensaje;
+            THROW 50001, @Mensaje, 1;
+        END
         IF (SELECT COUNT(*) FROM dbo.Till WHERE IS_ACTIVE = 1 AND IS_SERVER = 1) <> 1
-            THROW 50002, N'Till debe tener exactamente una caja activa con IS_SERVER = 1.', 1;
+        BEGIN
+            SET @Mensaje = N'Till debe tener exactamente una caja activa con IS_SERVER = 1.'
+                         + N' Verificar que el job esté instalado en la base de la caja servidora.'
+                         + @Mensaje;
+            THROW 50002, @Mensaje, 1;
+        END
 
         INSERT #cajas (cash_number, caja, es_servidor, nombre, servidor, prefijo)
         SELECT t.CASH_NUMBER,
@@ -200,7 +218,11 @@ BEGIN
         WHERE t.IS_ACTIVE = 1;
 
         IF (SELECT COUNT(*) FROM #cajas) < 2
-            THROW 50003, N'Se requieren al menos dos cajas activas en Till.', 1;
+        BEGIN
+            SET @Mensaje = N'Se requieren al menos dos cajas activas en Till.' + @Mensaje;
+            THROW 50003, @Mensaje, 1;
+        END
+        SET @Mensaje = NULL;
 
         /* ---------------------------------------------------------------------
            Caja nueva en Till: crear su servidor vinculado si no existe
