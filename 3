@@ -1,0 +1,7 @@
+SELECT c.name AS columna, t.name AS tipo
+FROM sys.columns c
+JOIN sys.types t ON t.user_type_id = c.user_type_id
+WHERE c.object_id = OBJECT_ID('dbo.Till')
+ORDER BY c.column_id;
+
+SELECT TOP (10) * FROM dbo.Till;
