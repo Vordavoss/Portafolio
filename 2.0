@@ -1,0 +1,550 @@
+/* =============================================================================
+   JOB DE HOMOLOGACIÓN DE PRECIOS - XposStore
+   Se instala y se ejecuta en la Caja 2 (caja servidora).
+
+   Flujo (según la especificación):
+     1. Lock: si ya hay una ejecución en curso, esta se omite.
+     2. Validar la conexión a todas las cajas. Si falla alguna: registrar
+        "Error de conectividad" y cancelar todo el proceso.
+     3. Ejecutar la consulta de precios en Caja 2, Caja 1 y Caja 3.
+     4. Consolidar la tabla comparativa por SKU y typePrice.
+     5. Si no hay SKUs con estatus 'DIFERENTES': registrar "Precios homologados".
+     6. Por cada SKU deshomologado:
+          - Precio ganador: el de la fecha más reciente (creado/modificado).
+          - UPDATE en las cajas con el precio desactualizado.
+          - Registrar en la tabla de auditoría.
+
+   @SoloReporte = 1 (valor por defecto): solo muestra la tabla de lo que se
+   cambiaría. No modifica precios ni escribe en la auditoría.
+   @SoloReporte = 0: aplica los cambios.
+
+   Casos que no se actualizan y se marcan para revisar:
+     - El SKU no existe en alguna caja.
+     - Empate: la fecha más reciente tiene precios distintos.
+     - Un SKU tiene más de un precio activo del mismo tipo en una caja.
+   ============================================================================= */
+
+USE XposStore_50LP1_P2;   -- Caja 2. En producción: la base XposStore de la Caja 2
+GO
+
+/* -----------------------------------------------------------------------------
+   Tabla de auditoría (especificación) + columna Error_Message
+   ----------------------------------------------------------------------------- */
+IF OBJECT_ID(N'dbo.Job_Homologacion_Precios_Log') IS NULL
+CREATE TABLE dbo.Job_Homologacion_Precios_Log (
+    LogID                BIGINT IDENTITY(1,1) PRIMARY KEY,
+    ExecutionDate        DATETIME DEFAULT GETDATE(),
+    SKU                  VARCHAR(100) NOT NULL,
+    PriceType            VARCHAR(50)  NOT NULL,
+    Previous_Caja1_Price DECIMAL(18,4),
+    Previous_Caja2_Price DECIMAL(18,4),
+    Previous_Caja3_Price DECIMAL(18,4),
+    Winning_Price        DECIMAL(18,4) NOT NULL,
+    Winning_Source_Caja  VARCHAR(20)   NOT NULL,
+    Updated_Boxes        VARCHAR(100)  NOT NULL,
+    Status               VARCHAR(20)   NOT NULL,   -- ACTUALIZADO / PARCIAL / ERROR
+    Error_Message        NVARCHAR(4000) NULL
+);
+
+/* -----------------------------------------------------------------------------
+   Bitácora de ejecuciones: conectividad, cancelaciones y resultado del job
+   ----------------------------------------------------------------------------- */
+IF OBJECT_ID(N'dbo.Job_Homologacion_Precios_Ejecucion') IS NULL
+CREATE TABLE dbo.Job_Homologacion_Precios_Ejecucion (
+    EjecucionID       INT IDENTITY(1,1) PRIMARY KEY,
+    ExecutionDate     DATETIME     NOT NULL DEFAULT GETDATE(),
+    Modo              VARCHAR(10)  NOT NULL,   -- REPORTE / CORRECCION
+    Status            VARCHAR(20)  NOT NULL,   -- OK / CANCELADO / OMITIDO / PARCIAL / ERROR
+    SKUs_Diferentes   INT NULL,
+    SKUs_Actualizar   INT NULL,
+    SKUs_Por_Revisar  INT NULL,
+    SKUs_Con_Error    INT NULL,
+    Mensaje           NVARCHAR(4000) NULL
+);
+GO
+
+
+CREATE OR ALTER PROCEDURE dbo.usp_Job_Homologacion_Precios
+    @SoloReporte BIT = 1
+AS
+BEGIN
+    SET NOCOUNT ON;
+    SET XACT_ABORT ON;
+
+    /* =========================================================================
+       CONFIGURACIÓN
+       Base de cada caja. En producción, con servidor vinculado:
+           N'[LNK_CAJA1].[XposStore].dbo.'
+       ========================================================================= */
+    DECLARE @db_caja1 NVARCHAR(300) = N'[XposStore_50LP1_v1].dbo.',
+            @db_caja2 NVARCHAR(300) = N'[XposStore_50LP1_P2].dbo.',
+            @db_caja3 NVARCHAR(300) = N'[XposStore_50LP1_v3].dbo.';
+
+    declare @price_types table (priceType varchar(100))
+
+    insert into @price_types
+    select 'SALE_PRICE'
+    --insert into @price_types
+    --select 'COST_PRICE'
+    --insert into @price_types
+    --select 'LOW_PRICE'
+
+    /* ========================================================================= */
+
+    declare @precios_caja2 table (sku varchar(100),price decimal(16,4),typePrice varchar(50),modified_datetime datetime, created_datetime datetime)
+    declare @precios_caja1 table (sku varchar(100),price decimal(16,4),typePrice varchar(50),modified_datetime datetime, created_datetime datetime)
+    declare @precios_caja3 table (sku varchar(100),price decimal(16,4),typePrice varchar(50),modified_datetime datetime, created_datetime datetime)
+
+    declare @cajas table (caja varchar(10) primary key, db nvarchar(300), en_linea bit, error nvarchar(4000))
+    insert into @cajas (caja, db) values ('Caja1', @db_caja1), ('Caja2', @db_caja2), ('Caja3', @db_caja3)
+
+    declare @comparativa table (
+        sku               varchar(100),
+        typePrice         varchar(50),
+        Precio_Caja1      decimal(16,4),
+        Precio_Caja2      decimal(16,4),
+        Precio_Caja3      decimal(16,4),
+        Estatus_Precios   varchar(20),
+        Fecha_Caja1       datetime,      -- la más reciente entre creado y modificado
+        Fecha_Caja2       datetime,
+        Fecha_Caja3       datetime,
+        Filas_Caja1       int,           -- NULL = no existe, >1 = duplicado
+        Filas_Caja2       int,
+        Filas_Caja3       int,
+        Precio_Ganador    decimal(16,4),
+        Caja_Ganadora     varchar(20),
+        Fecha_Ganadora    datetime,
+        Cajas_Actualizar  varchar(100),
+        Accion            varchar(300),
+        Resultado         varchar(20),
+        primary key (sku, typePrice)
+    )
+
+    DECLARE @EjecucionID INT,
+            @Modo        VARCHAR(10) = CASE WHEN @SoloReporte = 1 THEN 'REPORTE' ELSE 'CORRECCION' END,
+            @Status      VARCHAR(20),
+            @Mensaje     NVARCHAR(4000),
+            @Lock        INT,
+            @caja        VARCHAR(10),
+            @db          NVARCHAR(300),
+            @tipos       NVARCHAR(MAX),
+            @query       NVARCHAR(MAX),
+            @update      NVARCHAR(MAX),
+            @sql         NVARCHAR(MAX);
+
+    /* -------------------------------------------------------------------------
+       1. Lock: solo una ejecución a la vez
+       ------------------------------------------------------------------------- */
+    EXEC @Lock = sp_getapplock @Resource    = N'Job_Homologacion_Precios',
+                               @LockMode    = N'Exclusive',
+                               @LockOwner   = N'Session',
+                               @LockTimeout = 0;
+    IF @Lock < 0
+    BEGIN
+        INSERT dbo.Job_Homologacion_Precios_Ejecucion (Modo, Status, Mensaje)
+        VALUES (@Modo, 'OMITIDO', N'Ya hay una ejecución en curso.');
+        RAISERROR(N'Ya hay una ejecución en curso. Esta ejecución se omite.', 10, 1) WITH NOWAIT;
+        RETURN 1;
+    END
+
+    BEGIN TRY
+        INSERT dbo.Job_Homologacion_Precios_Ejecucion (Modo, Status) VALUES (@Modo, 'EN_CURSO');
+        SET @EjecucionID = SCOPE_IDENTITY();
+
+        /* ---------------------------------------------------------------------
+           2. Validar conexión a todas las cajas
+           --------------------------------------------------------------------- */
+        SET @caja = (SELECT MIN(caja) FROM @cajas);
+        WHILE @caja IS NOT NULL
+        BEGIN
+            SET @db  = (SELECT db FROM @cajas WHERE caja = @caja);
+            SET @sql = N'select top (0) 1 from ' + @db + N'PRICE';
+            BEGIN TRY
+                EXEC (@sql);
+                UPDATE @cajas SET en_linea = 1 WHERE caja = @caja;
+            END TRY
+            BEGIN CATCH
+                UPDATE @cajas SET en_linea = 0, error = ERROR_MESSAGE() WHERE caja = @caja;
+            END CATCH;
+            SET @caja = (SELECT MIN(caja) FROM @cajas WHERE caja > @caja);
+        END
+
+        /* ---------------------------------------------------------------------
+           3. Consulta de precios en cada caja
+           --------------------------------------------------------------------- */
+        IF NOT EXISTS (SELECT 1 FROM @cajas WHERE en_linea = 0)
+        BEGIN
+            SELECT @tipos = STRING_AGG(CAST('''' + REPLACE(priceType, '''', '''''') + ''''
+                                            AS NVARCHAR(MAX)), ',')
+            FROM @price_types;
+
+            SET @query = N'
+            select i.SKU,AMOUNT,pt.NAME,p.modified_datetime,p.created_datetime from {db}item as i
+            inner join {db}ITEM_BUSINESS_UNIT_LINK as il on il.ITEM_ID = i.ITEM_ID
+            inner join {db}PRICE as p on p.ITEM_BUSINESS_UNIT_LINK_ID = il.ITEM_BUSINESS_UNIT_LINK_ID
+            inner join {db}code as pt on pt.CODE_ID = p.PRICE_TYPE_CODE_ID
+            inner join {db}code as it on it.CODE_ID = i.ITEM_TYPE_CODE_ID
+            where
+                i.IS_ACTIVE = 1 and
+                p.IS_ACTIVE = 1 and
+                it.NAME = ''PRODUCT_ITEM'' and
+                pt.NAME in ({tipos})';
+            SET @query = REPLACE(@query, N'{tipos}', @tipos);
+
+            BEGIN TRY
+                ------------------------------
+                SET @caja = 'Caja2';
+                SET @sql = REPLACE(@query, N'{db}', @db_caja2);
+                insert into @precios_caja2 exec (@sql);
+
+                ------------------------------
+                SET @caja = 'Caja1';
+                SET @sql = REPLACE(@query, N'{db}', @db_caja1);
+                insert into @precios_caja1 exec (@sql);
+
+                ------------------------------
+                SET @caja = 'Caja3';
+                SET @sql = REPLACE(@query, N'{db}', @db_caja3);
+                insert into @precios_caja3 exec (@sql);
+            END TRY
+            BEGIN CATCH
+                UPDATE @cajas SET en_linea = 0, error = ERROR_MESSAGE() WHERE caja = @caja;
+            END CATCH;
+        END
+
+        /* ---------------------------------------------------------------------
+           Falla de conexión: registrar y cancelar el proceso completo
+           --------------------------------------------------------------------- */
+        IF EXISTS (SELECT 1 FROM @cajas WHERE en_linea = 0)
+        BEGIN
+            SELECT @Status  = 'CANCELADO',
+                   @Mensaje = N'Error de conectividad. Proceso cancelado. '
+                            + STRING_AGG(CAST(caja + N': ' + error AS NVARCHAR(MAX)), N' | ')
+            FROM @cajas
+            WHERE en_linea = 0;
+
+            UPDATE dbo.Job_Homologacion_Precios_Ejecucion
+               SET Status = @Status, Mensaje = @Mensaje
+            WHERE EjecucionID = @EjecucionID;
+
+            SELECT caja AS Caja,
+                   CASE en_linea WHEN 1 THEN 'EN LINEA'
+                                 WHEN 0 THEN 'SIN CONEXION'
+                                 ELSE 'NO VALIDADA' END AS Estado,
+                   error AS Error
+            FROM @cajas
+            ORDER BY caja;
+        END
+        ELSE
+        BEGIN
+            /* -----------------------------------------------------------------
+               4. Tabla comparativa por SKU y typePrice
+               ----------------------------------------------------------------- */
+            with TodosLosProductos as (
+                select sku, typePrice from @precios_caja1
+                union
+                select sku, typePrice from @precios_caja2
+                union
+                select sku, typePrice from @precios_caja3
+            ),
+            c1 as (select sku, typePrice, count(*) as filas, max(price) as price,
+                          max(case when modified_datetime is null or created_datetime > modified_datetime
+                                   then created_datetime else modified_datetime end) as fecha
+                   from @precios_caja1 group by sku, typePrice),
+            c2 as (select sku, typePrice, count(*) as filas, max(price) as price,
+                          max(case when modified_datetime is null or created_datetime > modified_datetime
+                                   then created_datetime else modified_datetime end) as fecha
+                   from @precios_caja2 group by sku, typePrice),
+            c3 as (select sku, typePrice, count(*) as filas, max(price) as price,
+                          max(case when modified_datetime is null or created_datetime > modified_datetime
+                                   then created_datetime else modified_datetime end) as fecha
+                   from @precios_caja3 group by sku, typePrice)
+            insert into @comparativa
+                   (sku, typePrice, Precio_Caja1, Precio_Caja2, Precio_Caja3, Estatus_Precios,
+                    Fecha_Caja1, Fecha_Caja2, Fecha_Caja3, Filas_Caja1, Filas_Caja2, Filas_Caja3)
+            select
+                t.sku,
+                t.typePrice,
+                c1.price, c2.price, c3.price,
+                case
+                    when c1.price = c2.price and c2.price = c3.price
+                         and c1.filas = 1 and c2.filas = 1 and c3.filas = 1 then 'ESTAN IGUALES'
+                    else 'DIFERENTES'
+                end,
+                c1.fecha, c2.fecha, c3.fecha,
+                c1.filas, c2.filas, c3.filas
+            from TodosLosProductos t
+            left join c1 on c1.sku = t.sku and c1.typePrice = t.typePrice
+            left join c2 on c2.sku = t.sku and c2.typePrice = t.typePrice
+            left join c3 on c3.sku = t.sku and c3.typePrice = t.typePrice;
+
+            /* -----------------------------------------------------------------
+               5. Precio ganador: fecha de creación/modificación más reciente
+                  (no aplica si hay duplicados en alguna caja)
+               ----------------------------------------------------------------- */
+            update c
+               set Precio_Ganador = g.price,
+                   Caja_Ganadora  = g.cajas,
+                   Fecha_Ganadora = m.fecha_max
+            from @comparativa as c
+            cross apply (select max(v.fecha) as fecha_max
+                         from (values ('Caja1', c.Precio_Caja1, c.Fecha_Caja1, c.Filas_Caja1),
+                                      ('Caja2', c.Precio_Caja2, c.Fecha_Caja2, c.Filas_Caja2),
+                                      ('Caja3', c.Precio_Caja3, c.Fecha_Caja3, c.Filas_Caja3))
+                              as v(caja, price, fecha, filas)
+                         where v.filas = 1 and v.fecha is not null) as m
+            cross apply (select count(distinct v.price) as precios,
+                                min(v.price) as price,
+                                string_agg(v.caja, ',') within group (order by v.caja) as cajas
+                         from (values ('Caja1', c.Precio_Caja1, c.Fecha_Caja1, c.Filas_Caja1),
+                                      ('Caja2', c.Precio_Caja2, c.Fecha_Caja2, c.Filas_Caja2),
+                                      ('Caja3', c.Precio_Caja3, c.Fecha_Caja3, c.Filas_Caja3))
+                              as v(caja, price, fecha, filas)
+                         where v.filas = 1 and v.fecha = m.fecha_max) as g
+            where c.Estatus_Precios = 'DIFERENTES'
+              and g.precios = 1                                 -- sin empate
+              and isnull(c.Filas_Caja1, 0) <= 1
+              and isnull(c.Filas_Caja2, 0) <= 1
+              and isnull(c.Filas_Caja3, 0) <= 1;
+
+            -- Cajas con el precio desactualizado
+            update c
+               set Cajas_Actualizar = u.cajas
+            from @comparativa as c
+            cross apply (select string_agg(v.caja, ',') within group (order by v.caja) as cajas
+                         from (values ('Caja1', c.Precio_Caja1, c.Filas_Caja1),
+                                      ('Caja2', c.Precio_Caja2, c.Filas_Caja2),
+                                      ('Caja3', c.Precio_Caja3, c.Filas_Caja3))
+                              as v(caja, price, filas)
+                         where v.filas = 1 and v.price <> c.Precio_Ganador) as u
+            where c.Precio_Ganador is not null;
+
+            -- Acción a tomar
+            update @comparativa
+               set Accion = case
+                   when Estatus_Precios = 'ESTAN IGUALES' then 'Sin cambio'
+                   when Filas_Caja1 > 1 or Filas_Caja2 > 1 or Filas_Caja3 > 1
+                        then 'REVISAR: precio duplicado en '
+                             + concat_ws(',', case when Filas_Caja1 > 1 then 'Caja1' end,
+                                              case when Filas_Caja2 > 1 then 'Caja2' end,
+                                              case when Filas_Caja3 > 1 then 'Caja3' end)
+                   when Precio_Ganador is null
+                        then 'REVISAR: empate de fecha con precios distintos'
+                   else concat_ws('; ',
+                        case when Cajas_Actualizar is not null
+                             then 'UPDATE ' + Cajas_Actualizar + ' a $'
+                                  + convert(varchar(30), cast(Precio_Ganador as decimal(16,2))) end,
+                        case when Filas_Caja1 is null or Filas_Caja2 is null or Filas_Caja3 is null
+                             then 'REVISAR: no existe en '
+                                  + concat_ws(',', case when Filas_Caja1 is null then 'Caja1' end,
+                                                   case when Filas_Caja2 is null then 'Caja2' end,
+                                                   case when Filas_Caja3 is null then 'Caja3' end) end)
+               end;
+
+            -- Estado inicial del resultado
+            update @comparativa
+               set Resultado = case when Accion like 'UPDATE%' then 'PENDIENTE'
+                                    when Accion like '%REVISAR%' then 'REVISAR' end
+            where Estatus_Precios = 'DIFERENTES';
+
+            /* -----------------------------------------------------------------
+               6. UPDATE por SKU en las cajas desactualizadas (solo @SoloReporte = 0)
+               ----------------------------------------------------------------- */
+            IF @SoloReporte = 0
+            BEGIN
+                SET @update = N'
+                update p set p.AMOUNT = @price, p.modified_datetime = @fecha
+                from {db}item as i
+                inner join {db}ITEM_BUSINESS_UNIT_LINK as il on il.ITEM_ID = i.ITEM_ID
+                inner join {db}PRICE as p on p.ITEM_BUSINESS_UNIT_LINK_ID = il.ITEM_BUSINESS_UNIT_LINK_ID
+                inner join {db}code as pt on pt.CODE_ID = p.PRICE_TYPE_CODE_ID
+                inner join {db}code as it on it.CODE_ID = i.ITEM_TYPE_CODE_ID
+                where
+                    i.SKU = @sku and
+                    pt.NAME = @typePrice and
+                    i.IS_ACTIVE = 1 and
+                    p.IS_ACTIVE = 1 and
+                    it.NAME = ''PRODUCT_ITEM'';
+                set @filas = @@ROWCOUNT;';
+
+                DECLARE @sku VARCHAR(100), @typePrice VARCHAR(50), @price DECIMAL(16,4),
+                        @fecha DATETIME, @cajas_actualizar VARCHAR(100), @filas INT,
+                        @actualizadas VARCHAR(100), @errores NVARCHAR(4000);
+
+                DECLARE cur_skus CURSOR LOCAL STATIC FOR
+                    SELECT sku, typePrice, Precio_Ganador, Fecha_Ganadora, Cajas_Actualizar
+                    FROM @comparativa
+                    WHERE Cajas_Actualizar IS NOT NULL
+                    ORDER BY sku, typePrice;
+
+                OPEN cur_skus;
+                FETCH NEXT FROM cur_skus INTO @sku, @typePrice, @price, @fecha, @cajas_actualizar;
+                WHILE @@FETCH_STATUS = 0
+                BEGIN
+                    SELECT @actualizadas = NULL, @errores = NULL;
+
+                    SET @caja = (SELECT MIN(caja) FROM @cajas);
+                    WHILE @caja IS NOT NULL
+                    BEGIN
+                        IF CHARINDEX(@caja, @cajas_actualizar) > 0
+                        BEGIN
+                            SET @db  = (SELECT db FROM @cajas WHERE caja = @caja);
+                            SET @sql = REPLACE(@update, N'{db}', @db);
+                            BEGIN TRY
+                                EXEC sp_executesql @sql,
+                                     N'@sku varchar(100), @typePrice varchar(50), @price decimal(16,4),
+                                       @fecha datetime, @filas int OUTPUT',
+                                     @sku, @typePrice, @price, @fecha, @filas OUTPUT;
+
+                                IF @filas = 1
+                                    SET @actualizadas = CONCAT_WS(',', @actualizadas, @caja);
+                                ELSE
+                                    SET @errores = CONCAT_WS(N' | ', @errores,
+                                        @caja + N': se actualizaron ' + CAST(@filas AS NVARCHAR(10))
+                                        + N' precios en lugar de 1');
+                            END TRY
+                            BEGIN CATCH
+                                SET @errores = CONCAT_WS(N' | ', @errores, @caja + N': ' + ERROR_MESSAGE());
+                            END CATCH;
+                        END
+                        SET @caja = (SELECT MIN(caja) FROM @cajas WHERE caja > @caja);
+                    END
+
+                    -- Registrar transacción en la auditoría
+                    INSERT dbo.Job_Homologacion_Precios_Log
+                           (SKU, PriceType, Previous_Caja1_Price, Previous_Caja2_Price,
+                            Previous_Caja3_Price, Winning_Price, Winning_Source_Caja,
+                            Updated_Boxes, Status, Error_Message)
+                    SELECT sku, typePrice, Precio_Caja1, Precio_Caja2, Precio_Caja3,
+                           Precio_Ganador, Caja_Ganadora, ISNULL(@actualizadas, ''),
+                           CASE WHEN @errores IS NULL      THEN 'ACTUALIZADO'
+                                WHEN @actualizadas IS NULL THEN 'ERROR'
+                                ELSE 'PARCIAL' END,
+                           @errores
+                    FROM @comparativa
+                    WHERE sku = @sku AND typePrice = @typePrice;
+
+                    UPDATE @comparativa
+                       SET Resultado = CASE WHEN @errores IS NULL      THEN 'ACTUALIZADO'
+                                            WHEN @actualizadas IS NULL THEN 'ERROR'
+                                            ELSE 'PARCIAL' END
+                    WHERE sku = @sku AND typePrice = @typePrice;
+
+                    FETCH NEXT FROM cur_skus INTO @sku, @typePrice, @price, @fecha, @cajas_actualizar;
+                END
+                CLOSE cur_skus;
+                DEALLOCATE cur_skus;
+            END
+
+            /* -----------------------------------------------------------------
+               Resultado de la ejecución
+               ----------------------------------------------------------------- */
+            SET @Status = CASE WHEN EXISTS (SELECT 1 FROM @comparativa
+                                            WHERE Resultado IN ('ERROR', 'PARCIAL'))
+                               THEN 'PARCIAL' ELSE 'OK' END;
+            SET @Mensaje = CASE
+                WHEN NOT EXISTS (SELECT 1 FROM @comparativa WHERE Estatus_Precios = 'DIFERENTES')
+                     THEN N'Precios homologados.'
+                WHEN @SoloReporte = 1
+                     THEN N'Modo reporte: no se modificó ningún precio.'
+                WHEN @Status = 'PARCIAL'
+                     THEN N'Algunas cajas no se pudieron actualizar. Revisar la auditoría.'
+                WHEN NOT EXISTS (SELECT 1 FROM @comparativa WHERE Cajas_Actualizar IS NOT NULL)
+                     THEN N'Sin precios por actualizar. Hay SKUs por revisar.'
+                ELSE N'Precios actualizados.' END;
+
+            UPDATE dbo.Job_Homologacion_Precios_Ejecucion
+               SET Status           = @Status,
+                   Mensaje          = @Mensaje,
+                   SKUs_Diferentes  = (SELECT COUNT(*) FROM @comparativa WHERE Estatus_Precios = 'DIFERENTES'),
+                   SKUs_Actualizar  = (SELECT COUNT(*) FROM @comparativa WHERE Cajas_Actualizar IS NOT NULL),
+                   SKUs_Por_Revisar = (SELECT COUNT(*) FROM @comparativa WHERE Accion LIKE '%REVISAR%'),
+                   SKUs_Con_Error   = (SELECT COUNT(*) FROM @comparativa WHERE Resultado IN ('ERROR', 'PARCIAL'))
+            WHERE EjecucionID = @EjecucionID;
+
+            -- Tabla de lo que se cambiaría (o se cambió)
+            select
+                sku,
+                typePrice,
+                Precio_Caja1,
+                Precio_Caja2,
+                Precio_Caja3,
+                Estatus_Precios,
+                Fecha_Caja1,
+                Fecha_Caja2,
+                Fecha_Caja3,
+                Precio_Ganador,
+                Caja_Ganadora,
+                Fecha_Ganadora,
+                Accion,
+                Resultado
+            from @comparativa
+            where Estatus_Precios = 'DIFERENTES'
+            order by sku asc, typePrice asc;
+        END
+
+        SELECT EjecucionID, ExecutionDate, Modo, Status, SKUs_Diferentes, SKUs_Actualizar,
+               SKUs_Por_Revisar, SKUs_Con_Error, Mensaje
+        FROM dbo.Job_Homologacion_Precios_Ejecucion
+        WHERE EjecucionID = @EjecucionID;
+    END TRY
+    BEGIN CATCH
+        SET @Mensaje = ERROR_MESSAGE();
+        UPDATE dbo.Job_Homologacion_Precios_Ejecucion
+           SET Status = 'ERROR', Mensaje = @Mensaje
+        WHERE EjecucionID = @EjecucionID;
+
+        EXEC sp_releaseapplock @Resource = N'Job_Homologacion_Precios', @LockOwner = N'Session';
+        THROW;
+    END CATCH
+
+    EXEC sp_releaseapplock @Resource = N'Job_Homologacion_Precios', @LockOwner = N'Session';
+
+    -- Cancelado o con errores: código de salida distinto de cero para la tarea programada
+    IF @Status IN ('CANCELADO', 'PARCIAL')
+        RAISERROR(@Mensaje, 16, 1);
+END
+GO
+
+
+/* =============================================================================
+   EJECUCIÓN
+   ============================================================================= */
+-- Solo mostrar lo que se cambiaría:
+-- EXEC dbo.usp_Job_Homologacion_Precios @SoloReporte = 1;
+
+-- Aplicar los cambios:
+-- EXEC dbo.usp_Job_Homologacion_Precios @SoloReporte = 0;
+
+-- Bitácora:
+-- SELECT TOP (20) * FROM dbo.Job_Homologacion_Precios_Ejecucion ORDER BY EjecucionID DESC;
+-- SELECT TOP (100) * FROM dbo.Job_Homologacion_Precios_Log ORDER BY LogID DESC;
+
+
+/* =============================================================================
+   PRODUCCIÓN
+   -----------------------------------------------------------------------------
+   1. Servidor vinculado por cada caja remota (en la Caja 2):
+
+      EXEC sp_addlinkedserver @server = N'LNK_CAJA1', @srvproduct = N'',
+           @provider = N'MSOLEDBSQL', @datasrc = N'<SERVIDOR_CAJA1>\SQLEXPRESS',
+           @provstr = N'Encrypt=yes;TrustServerCertificate=yes';
+      EXEC sp_addlinkedsrvlogin @rmtsrvname = N'LNK_CAJA1', @useself = N'FALSE',
+           @locallogin = NULL, @rmtuser = N'<USUARIO>', @rmtpassword = N'<PASSWORD>';
+      EXEC sp_serveroption N'LNK_CAJA1', 'connect timeout', '10';
+      EXEC sp_serveroption N'LNK_CAJA1', 'query timeout', '300';
+
+      El usuario remoto necesita SELECT en item, ITEM_BUSINESS_UNIT_LINK, PRICE
+      y code, y UPDATE en PRICE.
+
+   2. En la sección CONFIGURACIÓN del procedimiento:
+      @db_caja1 = N'[LNK_CAJA1].[XposStore].dbo.'
+      @db_caja2 = N'[XposStore].dbo.'
+      @db_caja3 = N'[LNK_CAJA3].[XposStore].dbo.'
+
+   3. Tarea programada (SQL Server Express no tiene SQL Server Agent):
+
+      schtasks /Create /TN "Homologacion de precios" /SC MINUTE /MO 30 ^
+        /TR "sqlcmd -S localhost\SQLEXPRESS -E -b -d XposStore -Q \"EXEC dbo.usp_Job_Homologacion_Precios @SoloReporte = 0\"" ^
+        /RU <CUENTA> /RP <PASSWORD>
+   ============================================================================= */
