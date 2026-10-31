@@ -1,2 +1,1 @@
-Msg 50002, Level 16, State 1, Procedure usp_Job_Homologacion_Precios, Line 111 [Batch Start Line 0]
-Till debe tener exactamente una caja activa con IS_SERVER = 1. Verificar que el job esté instalado en la base de la caja servidora. Base: XposStore_10ZAI50ASN_P2. Till: CASH_NUMBER=1 NAME=ZAIASNVT1 IS_ACTIVE=1 IS_SERVER=0 | CASH_NUMBER=2 NAME=EP-4NP13T3 IS_ACTIVE=0 IS_SERVER=1
+https://femcom-my.sharepoint.com/personal/btiend31_serviciosexternos_com_mx/_layouts/15/onedrive.aspx?id=%2Fpersonal%2Fbtiend31%5Fserviciosexternos%5Fcom%5Fmx%2FDocuments%2Fpublico%2FDS50&ct=1792596003976&or=Teams%2DHL&ga=1
