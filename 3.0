@@ -1,6 +1,7 @@
-/* =============================================================================
+﻿/* =============================================================================
    JOB DE HOMOLOGACIÓN DE PRECIOS - XposStore (n cajas)
-   Se instala y se ejecuta en la base XposStore de la caja servidora (Caja 2).
+   Se instala y se ejecuta en la base de la caja servidora, se llame como se
+   llame (seleccionarla antes de ejecutar este script).
 
    Cajas: se leen de dbo.Till en cada ejecución.
      - La caja con IS_SERVER = 1 es la local (la base donde corre el job).
@@ -9,8 +10,8 @@
      - Las demás cajas se incluyen si tienen IS_ACTIVE = 1.
      - Cada caja se identifica solo por CASH_NUMBER. NAME puede cambiar, por
        eso solo se usa como dato informativo en los mensajes.
-     - Las demás cajas se localizan con las plantillas de la sección
-       CONFIGURACIÓN, usando {n} = CASH_NUMBER.
+     - Las demás cajas se localizan a partir del nombre de la base donde está
+       instalado el procedimiento (ver sección CONFIGURACIÓN).
      - Una caja nueva en Till se incluye sola en cuanto exista su servidor
        vinculado (producción). Si no existe, el job se cancela e indica cuál
        falta.
@@ -37,7 +38,14 @@
      - Un SKU tiene más de un precio activo del mismo tipo en una caja.
    ============================================================================= */
 
-USE XposStore_50LP1_P2;   -- Caja servidora. En producción: su base XposStore
+-- Se instala en la base seleccionada. Si no es una base XposStore, no se instala nada.
+IF OBJECT_ID(N'dbo.Till') IS NULL
+BEGIN
+    DECLARE @base_actual SYSNAME = DB_NAME();
+    RAISERROR(N'La base %s no tiene dbo.Till. Seleccionar la base de la caja servidora y volver a ejecutar.',
+              16, 1, @base_actual);
+    SET NOEXEC ON;
+END
 GO
 
 /* -----------------------------------------------------------------------------
@@ -94,17 +102,20 @@ BEGIN
 
     /* =========================================================================
        CONFIGURACIÓN
-       Ubicación de las cajas que no son servidor. {n} = CASH_NUMBER.
+       La caja servidora es la base donde está instalado este procedimiento,
+       con cualquier nombre. Ubicación de las demás cajas ({n} = CASH_NUMBER):
 
        Ambiente de pruebas (todas las bases en la misma instancia):
            @plantilla_servidor = NULL
-           @plantilla_base     = N'XposStore_50LP1_v{n}'
+           La base de cada caja se busca en la instancia: el nombre de esta
+           base hasta el último '_', luego '_' + letras + CASH_NUMBER.
+           Ej. desde XposStore_10ZAI50ASN_P2 la Caja1 es XposStore_10ZAI50ASN_P1
+           (o _v1, _1, ...).
        Producción (un servidor vinculado por caja: CAJA1, CAJA3, ...):
            @plantilla_servidor = N'CAJA{n}'
-           @plantilla_base     = N'XposStore'
+           La base remota tiene el mismo nombre que esta base.
        ========================================================================= */
-    DECLARE @plantilla_servidor SYSNAME = NULL,
-            @plantilla_base     SYSNAME = N'XposStore_50LP1_v{n}';
+    DECLARE @plantilla_servidor SYSNAME = NULL;
 
     declare @price_types table (priceType varchar(100))
 
@@ -123,6 +134,7 @@ BEGIN
         es_servidor BIT            NOT NULL,
         nombre      VARCHAR(100)   NULL,         -- NAME de Till (solo informativo)
         servidor    SYSNAME        NULL,         -- servidor vinculado (NULL = local)
+        base        SYSNAME        NULL,         -- base de la caja
         prefijo     NVARCHAR(400)  NULL,         -- [servidor].[base].dbo.
         en_linea    BIT            NULL,
         error       NVARCHAR(4000) NULL
@@ -150,7 +162,9 @@ BEGIN
             @sql         NVARCHAR(MAX),
             @cols_precio NVARCHAR(MAX),
             @cols_fecha  NVARCHAR(MAX),
-            @servidor    SYSNAME;
+            @servidor    SYSNAME,
+            @tienda      SYSNAME,
+            @patron      NVARCHAR(400);
 
     /* -------------------------------------------------------------------------
        1. Lock: solo una ejecución a la vez
@@ -210,23 +224,49 @@ BEGIN
             THROW 50001, @Mensaje, 1;
         END
 
-        INSERT #cajas (cash_number, caja, es_servidor, nombre, servidor, prefijo)
+        -- Servidora y producción: base con el mismo nombre que esta
+        INSERT #cajas (cash_number, caja, es_servidor, nombre, servidor, base)
         SELECT t.CASH_NUMBER,
                'Caja' + CAST(t.CASH_NUMBER AS VARCHAR(10)),
                t.IS_SERVER,
                LTRIM(RTRIM(t.NAME)),
                s.servidor,
-               CASE WHEN t.IS_SERVER = 1
-                    THEN QUOTENAME(DB_NAME()) + N'.dbo.'
-                    ELSE ISNULL(QUOTENAME(s.servidor) + N'.', N'')
-                         + QUOTENAME(REPLACE(@plantilla_base, N'{n}', t.CASH_NUMBER)) + N'.dbo.'
-               END
+               CASE WHEN t.IS_SERVER = 1 OR s.servidor IS NOT NULL THEN DB_NAME() END
         FROM dbo.Till AS t
         CROSS APPLY (SELECT CASE WHEN t.IS_SERVER = 0
                                  THEN REPLACE(@plantilla_servidor, N'{n}', t.CASH_NUMBER)
                             END AS servidor) AS s
         WHERE (t.CASH_NUMBER = @cash_servidor AND t.IS_SERVER = 1)
            OR (t.IS_ACTIVE = 1 AND ISNULL(t.IS_SERVER, 0) = 0);
+
+        -- Pruebas: base de cada caja en esta instancia, <tienda>_<letras><CASH_NUMBER>
+        -- (<tienda> = nombre de esta base hasta el último '_')
+        SET @tienda = DB_NAME();
+        IF CHARINDEX(N'_', @tienda) > 0
+            SET @tienda = LEFT(@tienda, LEN(@tienda) - CHARINDEX(N'_', REVERSE(@tienda)));
+        SET @patron = REPLACE(REPLACE(REPLACE(@tienda, N'[', N'[[]'), N'_', N'[_]'), N'%', N'[%]')
+                    + N'[_]%';
+
+        UPDATE c
+           SET base  = CASE WHEN b.bases = 1 THEN b.primera END,
+               error = CASE WHEN b.bases = 0
+                            THEN N'No existe su base en esta instancia (' + @tienda + N'_*' + n.txt + N').'
+                            WHEN b.bases > 1
+                            THEN N'Hay ' + CAST(b.bases AS NVARCHAR(10)) + N' bases posibles ('
+                                 + b.primera + N', ' + b.ultima + N'). Dejar solo una.'
+                       END
+        FROM #cajas AS c
+        CROSS APPLY (SELECT CAST(c.cash_number AS NVARCHAR(10)) AS txt) AS n
+        CROSS APPLY (SELECT COUNT(*) AS bases, MIN(d.name) AS primera, MAX(d.name) AS ultima
+                     FROM sys.databases AS d
+                     WHERE d.name LIKE @patron + n.txt
+                       AND d.name NOT LIKE @patron + N'[0-9]' + n.txt   -- _P11 no es la Caja1
+                       AND d.name <> DB_NAME()) AS b
+        WHERE c.base IS NULL;
+
+        UPDATE #cajas
+           SET prefijo = ISNULL(QUOTENAME(servidor) + N'.', N'') + QUOTENAME(base) + N'.dbo.'
+        WHERE base IS NOT NULL;
 
         IF (SELECT COUNT(*) FROM #cajas) < 2
         BEGIN
@@ -241,9 +281,8 @@ BEGIN
         SET @n = (SELECT MIN(cash_number) FROM #cajas);
         WHILE @n IS NOT NULL
         BEGIN
-            SET @sql = N'select top (0) 1 from ' + (SELECT prefijo FROM #cajas WHERE cash_number = @n) + N'PRICE';
+            SELECT @servidor = servidor, @prefijo = prefijo FROM #cajas WHERE cash_number = @n;
             BEGIN TRY
-                SET @servidor = (SELECT servidor FROM #cajas WHERE cash_number = @n);
                 IF @servidor IS NOT NULL
                    AND NOT EXISTS (SELECT 1 FROM sys.servers WHERE name = @servidor)
                 BEGIN
@@ -251,6 +290,9 @@ BEGIN
                                  + N'. Crearlo apuntando al equipo de esta caja.';
                     THROW 50005, @Mensaje, 1;
                 END
+                IF @prefijo IS NULL
+                    THROW 50006, N'No se encontró la base de esta caja.', 1;
+                SET @sql = N'select top (0) 1 from ' + @prefijo + N'PRICE';
                 EXEC (@sql);
                 UPDATE #cajas SET en_linea = 1 WHERE cash_number = @n;
             END TRY
@@ -589,6 +631,10 @@ END
 GO
 
 
+SET NOEXEC OFF;   -- fin de la instalación
+GO
+
+
 /* =============================================================================
    EJECUCIÓN
    ============================================================================= */
@@ -608,7 +654,7 @@ GO
    -----------------------------------------------------------------------------
    1. En la sección CONFIGURACIÓN del procedimiento:
       @plantilla_servidor = N'CAJA{n}'
-      @plantilla_base     = N'XposStore'
+      (la base remota de cada caja tiene el mismo nombre que la servidora)
 
    2. Un servidor vinculado por cada caja que no es servidor, con el nombre
       CAJA + CASH_NUMBER. Se crea una sola vez y apunta al equipo de la caja;
@@ -639,6 +685,6 @@ GO
    3. Tarea programada (SQL Server Express no tiene SQL Server Agent):
 
       schtasks /Create /TN "Homologacion de precios" /SC MINUTE /MO 30 ^
-        /TR "sqlcmd -S localhost\SQLEXPRESS -E -b -d XposStore -Q \"EXEC dbo.usp_Job_Homologacion_Precios @SoloReporte = 0\"" ^
+        /TR "sqlcmd -S localhost\SQLEXPRESS -E -b -d <BASE_CAJA_SERVIDORA> -Q \"EXEC dbo.usp_Job_Homologacion_Precios @SoloReporte = 0\"" ^
         /RU <CUENTA> /RP <PASSWORD>
    ============================================================================= */
