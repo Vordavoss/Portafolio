@@ -1,0 +1,179 @@
+----------------------------------------------------
+-- HOMOLOGACION DE PRECIOS ENTRE CAJAS
+-- Se ejecuta en la base de la caja servidora (Caja 2)
+-- Version para revision: solo muestra lo que se cambiaria, no actualiza precios
+----------------------------------------------------
+use XposStore_10ZAI50ASN_P2
+
+set nocount on
+
+-- base de las demas cajas, {n} = CASH_NUMBER de Till
+declare @base_cajas varchar(200) = 'XposStore_10ZAI50ASN_v{n}'
+
+declare @price_types table (priceType varchar(100))
+insert into @price_types
+select 'SALE_PRICE'
+--insert into @price_types
+--select 'COST_PRICE'
+--insert into @price_types
+--select 'LOW_PRICE'
+
+declare @cajas table (cash_number int, caja varchar(20), base varchar(200), error varchar(4000))
+declare @precios table (caja varchar(20), sku varchar(100), price decimal(16,4), typePrice varchar(50), modified_datetime datetime, created_datetime datetime)
+declare @detalle table (sku varchar(100), typePrice varchar(50), cash_number int, caja varchar(20), filas int, price decimal(16,4), fecha datetime)
+declare @comparativa table (sku varchar(100), typePrice varchar(50), estatus varchar(20), fecha_ganadora datetime, precio_ganador decimal(16,4), caja_ganadora varchar(20), motivo varchar(50))
+
+declare @lock int, @n int, @caja varchar(20), @base varchar(200), @tipos varchar(1000), @sql nvarchar(max)
+
+------------------------------
+-- Evita que se ejecute dos veces al mismo tiempo
+exec @lock = sp_getapplock @Resource = 'homologacion_precios', @LockMode = 'Exclusive', @LockOwner = 'Session', @LockTimeout = 0
+if @lock < 0
+begin
+    print 'Ya hay una ejecucion en curso'
+    return
+end
+
+------------------------------
+-- Cajas: la servidora (IS_SERVER = 1) y las demas activas
+insert into @cajas (cash_number, caja, base)
+select CASH_NUMBER,
+       'Caja' + cast(CASH_NUMBER as varchar(10)),
+       case when IS_SERVER = 1 then db_name()
+            else replace(@base_cajas, '{n}', cast(CASH_NUMBER as varchar(10))) end
+from Till
+where IS_SERVER = 1 or IS_ACTIVE = 1
+
+select @tipos = string_agg('''' + priceType + '''', ',') from @price_types
+
+------------------------------
+-- Precios de cada caja
+set @n = (select min(cash_number) from @cajas)
+while @n is not null
+begin
+    select @caja = caja, @base = quotename(base) from @cajas where cash_number = @n
+
+    set @sql = '
+    select ''' + @caja + ''', i.SKU,AMOUNT,pt.NAME,p.modified_datetime,p.created_datetime from ' + @base + '.dbo.item as i
+    inner join ' + @base + '.dbo.ITEM_BUSINESS_UNIT_LINK as il on il.ITEM_ID = i.ITEM_ID
+    inner join ' + @base + '.dbo.PRICE as p on p.ITEM_BUSINESS_UNIT_LINK_ID = il.ITEM_BUSINESS_UNIT_LINK_ID
+    inner join ' + @base + '.dbo.code as pt on pt.CODE_ID = p.PRICE_TYPE_CODE_ID
+    inner join ' + @base + '.dbo.code as it on it.CODE_ID = i.ITEM_TYPE_CODE_ID
+    where
+        i.IS_ACTIVE = 1 and
+        p.IS_ACTIVE = 1 and
+        it.NAME = ''PRODUCT_ITEM'' and
+        pt.NAME in (' + @tipos + ')'
+
+    begin try
+        insert into @precios
+        exec (@sql)
+    end try
+    begin catch
+        update @cajas set error = error_message() where cash_number = @n
+    end catch
+
+    set @n = (select min(cash_number) from @cajas where cash_number > @n)
+end
+
+-- Si alguna caja no respondio se cancela todo
+if exists (select 1 from @cajas where error is not null)
+begin
+    select caja, base, isnull(error, 'OK') as estado from @cajas order by cash_number
+    print 'Proceso cancelado: no se pudo consultar una o mas cajas'
+    exec sp_releaseapplock @Resource = 'homologacion_precios', @LockOwner = 'Session'
+    return
+end
+
+------------------------------
+-- Un registro por sku y caja (filas = 0 no existe, filas > 1 duplicado)
+insert into @detalle
+select p.sku, p.typePrice, c.cash_number, c.caja, count(*), max(p.price),
+       max(case when p.modified_datetime > p.created_datetime or p.created_datetime is null
+                then p.modified_datetime else p.created_datetime end)
+from @precios as p
+inner join @cajas as c on c.caja = p.caja
+group by p.sku, p.typePrice, c.cash_number, c.caja
+
+insert into @detalle (sku, typePrice, cash_number, caja, filas)
+select t.sku, t.typePrice, c.cash_number, c.caja, 0
+from (select distinct sku, typePrice from @precios) as t
+cross join @cajas as c
+where not exists (select 1 from @detalle as d
+                  where d.sku = t.sku and d.typePrice = t.typePrice and d.caja = c.caja)
+
+------------------------------
+-- Comparativa por sku y typePrice
+insert into @comparativa (sku, typePrice, estatus)
+select sku, typePrice,
+       case when min(filas) = 1 and max(filas) = 1
+             and min(isnull(price, -1)) = max(isnull(price, -1)) then 'ESTAN IGUALES'
+            else 'DIFERENTES' end
+from @detalle
+group by sku, typePrice
+
+-- SKUs con precio duplicado en alguna caja: no se calcula ganador
+update c
+set motivo = 'precio duplicado'
+from @comparativa as c
+where c.estatus = 'DIFERENTES'
+  and exists (select 1 from @detalle as d
+              where d.sku = c.sku and d.typePrice = c.typePrice and d.filas > 1)
+
+-- Precio ganador: el de la fecha mas reciente (creado/modificado)
+update c
+set fecha_ganadora = (select max(d.fecha) from @detalle as d
+                      where d.sku = c.sku and d.typePrice = c.typePrice and d.filas = 1)
+from @comparativa as c
+where c.estatus = 'DIFERENTES' and c.motivo is null
+
+update c
+set motivo = 'empate de fecha con precios distintos'
+from @comparativa as c
+where c.estatus = 'DIFERENTES' and c.motivo is null
+  and (select count(distinct d.price) from @detalle as d
+       where d.sku = c.sku and d.typePrice = c.typePrice
+         and d.filas = 1 and d.fecha = c.fecha_ganadora) > 1
+
+update c
+set precio_ganador = g.price, caja_ganadora = g.caja
+from @comparativa as c
+cross apply (select top 1 d.price, d.caja from @detalle as d
+             where d.sku = c.sku and d.typePrice = c.typePrice
+               and d.filas = 1 and d.fecha = c.fecha_ganadora
+             order by d.cash_number) as g
+where c.estatus = 'DIFERENTES' and c.motivo is null
+
+----------------------------------------------------
+-- RESULTADO: lo que se cambiaria
+----------------------------------------------------
+select d.sku,
+       d.typePrice,
+       d.caja,
+       d.price as precio_actual,
+       d.fecha as fecha_actual,
+       c.precio_ganador,
+       c.caja_ganadora,
+       c.fecha_ganadora,
+       case when d.filas = 0 then 'REVISAR: no existe en esta caja'
+            when d.filas > 1 then 'REVISAR: precio duplicado en esta caja'
+            when c.motivo is not null then 'REVISAR: ' + c.motivo
+            else 'UPDATE a $' + convert(varchar(30), cast(c.precio_ganador as decimal(16,2)))
+       end as accion
+from @detalle as d
+inner join @comparativa as c on c.sku = d.sku and c.typePrice = d.typePrice
+where c.estatus = 'DIFERENTES'
+  and (d.filas <> 1
+       or (c.motivo = 'empate de fecha con precios distintos' and d.fecha = c.fecha_ganadora)
+       or (c.motivo is null and d.price <> c.precio_ganador))
+order by d.sku, d.typePrice, d.cash_number
+
+select (select count(*) from @cajas) as cajas,
+       (select count(*) from @comparativa) as skus_comparados,
+       (select count(*) from @comparativa where estatus = 'DIFERENTES') as skus_diferentes,
+       (select count(*) from @comparativa as c
+        where exists (select 1 from @detalle as d
+                      where d.sku = c.sku and d.typePrice = c.typePrice
+                        and d.filas = 1 and d.price <> c.precio_ganador)) as skus_a_actualizar
+
+exec sp_releaseapplock @Resource = 'homologacion_precios', @LockOwner = 'Session'
