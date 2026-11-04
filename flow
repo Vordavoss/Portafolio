@@ -1,0 +1,39 @@
+flowchart TD
+    A([Endpoint o cron]) --> B["START_PRICE_HOMOLOGATION<br/>Lock + registro en EXECUTION<br/>Depura DETAIL &gt; 30 días"]
+    B --> C{¿Otra ejecución<br/>en curso?}
+    C -- Sí --> C1[/STATUS = SKIPPED/] --> Z([Fin])
+    C -- No --> D["Lee cajas de dbo.Till<br/>Servidor: IS_SERVER = 1<br/>Resto: IS_ACTIVE = 1"]
+    D --> E{¿Till válida?<br/>servidor único, sin duplicados, 2+ cajas}
+    E -- No --> E1[/STATUS = ERROR<br/>mensaje con contenido de Till/] --> Z
+    E -- Sí --> F["Back: conexión por CASH_NUMBER<br/>(ITillConnectionProvider)"]
+    F --> G["En paralelo, cada caja:<br/>abrir conexión (10 s)<br/>GET_HOMOLOGATION_PRICES"]
+    G --> H{¿Todas las cajas<br/>respondieron?}
+    H -- No --> H1["END_PRICE_HOMOLOGATION<br/>STATUS = CANCELED<br/>No se cambia nada"] --> Z
+    H -- Sí --> I["PROCESS_PRICE_HOMOLOGATION<br/>Un TVP con los precios de todas las cajas"]
+    I --> J{Por SKU y tipo de precio:<br/>¿todas las cajas iguales?}
+    J -- Sí --> J1[Se descarta<br/>no se guarda]
+    J -- No --> K{¿Precio duplicado<br/>o empate de fecha?}
+    K -- Duplicado / empate --> K1[Todas las filas del SKU<br/>STATUS = REVIEW]
+    K -- No --> L["Ganador = fecha más reciente<br/>Caja con ganador: OK<br/>Caja desactualizada: PENDING<br/>Caja sin el SKU: REVIEW"]
+    K1 --> M[(PRICE_HOMOLOGATION_DETAIL)]
+    L --> M
+    M --> N{¿Modo corrección?<br/>@IS_REPORT_ONLY = 0}
+    N -- No: reporte --> R
+    N -- Sí --> O["Por cada caja con PENDING:<br/>GET_HOMOLOGATION_CHANGES"]
+    O --> P["UPDATE_HOMOLOGATION_PRICES en la caja<br/>Una transacción: todo o nada"]
+    P --> Q{¿Se aplicó?}
+    Q -- Sí --> Q1[INSERT_HOMOLOGATION_RESULTS<br/>STATUS = UPDATED]
+    Q -- No --> Q2[INSERT_HOMOLOGATION_RESULTS<br/>STATUS = ERROR + mensaje<br/>la caja se revierte completa]
+    Q1 --> O2{¿Más cajas?}
+    Q2 --> O2
+    O2 -- Sí --> O
+    O2 -- No --> R["END_PRICE_HOMOLOGATION<br/>Contadores y mensaje<br/>OK / PARTIAL<br/>Libera el lock"]
+    R --> S[GET_HOMOLOGATION_REPORT<br/>PRICE_TILLn, DATE_TILLn, WINNING_PRICE, ACTION, RESULT]
+    S --> Z
+
+    classDef fin fill:#1F3A5F,color:#fff,stroke:#1F3A5F
+    classDef alerta fill:#FDECEA,stroke:#C0392B,color:#1E2A36
+    classDef tabla fill:#E8F5EC,stroke:#2E7D4F,color:#1E2A36
+    class A,Z fin
+    class C1,E1,H1,Q2 alerta
+    class M tabla
